@@ -1,0 +1,147 @@
+---
+title: "sCARGO"
+author: "Jonathan Augustin"
+date: "12/28/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(monocle3)
+library(ggplot2)
+library(biomaRt)
+library(Matrix)
+library(magrittr)
+library(data.table)
+library(tibble)
+library(readr)
+library(stringr)
+library(pbapply)
+library(progress)
+```
+
+```{r}
+#import and prepare human TADs
+hTADs<-fread(input="../Assets/hESC_lifover_hg38.bed")
+colnames(hTADs)<-c("chr", "start", "end")
+hTADs$chr<-str_replace(hTADs$chr, "chr", "")
+
+#import SNPs and diseases
+GWAS_dat<-function(){
+ read_tsv("https://www.ebi.ac.uk/gwas/api/search/downloads/alternative") }
+
+dat<-read_tsv("https://www.ebi.ac.uk/gwas/api/search/downloads/alternative")
+ensembl<-useEnsembl("ensembl", dataset = "hsapiens_gene_ensembl")
+
+#Should add the ability to use your own gene annotations from a gtf file...
+#Add genome version selection
+#Add progress bar functionality
+#Point to TAD and SNP data online (The SNP data base is a bit too large... maybe I can dynamically scrape what is needed? Or create import function to break it up? Create the illusion of speed lol
+#Add mouse support
+
+
+sCARGO<-function(disease=NULL, diff_genes=NULL, SNP=NULL){
+  #progress bar sometimes crashes the program
+  #pb <- progress_bar$new(format= "Progress [:bar] :percent eta: :eta",total = 100, clear = FALSE)
+  if (is.null(diff_genes)==TRUE && is.null(SNP)==TRUE){
+  SNPs<-dat[dat$`DISEASE/TRAIT` %in% as.character(disease),]
+  SNPs<-SNPs[,c("CHR_ID", "CHR_POS", "SNPS", "P-VALUE", "MAPPED_TRAIT")]
+  SNPs<-SNPs[complete.cases(SNPs),]
+  SNPs$start<-ifelse(as.numeric(as.character(SNPs$CHR_POS)) - 1000000 > 0, as.numeric(as.character(SNPs$CHR_POS)) - 1000000, 0) 
+  SNPs$end<-as.numeric(as.character(SNPs$CHR_POS)) + 1000000
+  SNPs$coord<-paste0(SNPs$CHR_ID,":", SNPs$start, ":", SNPs$end)
+  coords.list<-as.list(SNPs$coord)
+  #########
+  get_genes<-function(x){
+  tmp<-getBM(attributes = c("ensembl_gene_id","hgnc_symbol", "chromosome_name","start_position","end_position","gene_biotype"),
+             filters = c("chromosomal_region"), 
+             values = list(chromosomal_region=coords.list[x]), 
+             mart = ensembl)
+  tmp$SNP <- SNPs$SNPS[x]
+  return(tmp)}
+  #########
+  gene_list<-pblapply(c(1:length(coords.list)), get_genes)
+  gene_list<-do.call("rbind", gene_list)
+  gene_list<-gene_list[!duplicated(gene_list[c(1,7)]),]
+  tads.bed <- with(hTADs, GRanges(paste0("chr",chr), IRanges(start+1, end)))
+  snploc<-data.frame("chr" = as.numeric(as.character(SNPs$CHR_ID)) , "start" = as.numeric(as.character(SNPs$CHR_POS)), "end" = as.numeric(as.character(SNPs$CHR_POS)), "snp"= SNPs$SNPS)
+  snps.bed <- with(snploc, GRanges(paste0("chr",chr), IRanges(start,end, names = snp)), snp = snp)
+  overlaps <- findOverlaps(snps.bed, tads.bed, ignore.strand = T, type = "any")
+  match_hit <- data.frame(snps.bed[queryHits(overlaps),],tads.bed[subjectHits(overlaps),], names(snps.bed)[queryHits(overlaps)],stringsAsFactors=F)
+  snp.tads <- match_hit %>% dplyr::select(seqnames.1, start.1, end.1, width.1, names.snps.bed..queryHits.overlaps..) %>% rename(seqnames.1 = "chr", start.1 = "start", end.1 = "end", width.1 = "tad.length", names.snps.bed..queryHits.overlaps.. = "snp")
+  dis.tads <- snp.tads[,c(1,2,3,5)]
+  names(dis.tads) <- c("chr","start","end","snp")
+  dis.tads$chr <- str_replace(dis.tads$chr,"chr", "")
+  dis.tads$coordinates <- paste0(dis.tads$chr, ":",dis.tads$start,":", dis.tads$end)
+  tad.coords.list <- as.list(dis.tads$coordinates)
+  #########
+  tad_genes<-function(x){
+  tmp<-getBM(attributes = c("ensembl_gene_id","hgnc_symbol", "chromosome_name", "start_position","end_position","gene_biotype"),
+             filters = c("chromosomal_region"),values = list(chromosomal_region=tad.coords.list[x]), mart = ensembl) 
+  tmp$SNP <- dis.tads$snp[x] 
+  return(tryCatch(tmp, error=function(e) NULL))}
+  #########
+  tad_gene_list<-pblapply(c(1:length(tad.coords.list)), tad_genes)
+  tad_gene_list<-do.call("rbind", tad_gene_list)
+  tad_gene_list<-tad_gene_list[!duplicated(tad_gene_list[c(1,7)]),]
+  merge_result <- unique(rbind(gene_list, tad_gene_list))
+  colnames(merge_result) <- c("gene_id","hgnc_symbol","chromosome_name","start_position","end_position","gene_biotype","SNP") 
+  ######
+  return(DT::datatable(caption = paste0("Genes likely impacted due to ",disease," GWAS data", sep=""), merge_result))} 
+  
+  else if (is.null(diff_genes)==TRUE && is.null(SNP) ==FALSE){ 
+    return(print("User generated SNP list usage is still in development"))}
+  
+  else if (is.null(diff_genes) == FALSE && is.null(SNP) ==TRUE){
+    SNPs<-dat[dat$`DISEASE/TRAIT` %in% as.character(disease),]
+  SNPs<-SNPs[,c("CHR_ID", "CHR_POS", "SNPS", "P-VALUE", "MAPPED_TRAIT")]
+  SNPs<-SNPs[complete.cases(SNPs),]
+  SNPs$start<-ifelse(as.numeric(as.character(SNPs$CHR_POS)) - 1000000 > 0, as.numeric(as.character(SNPs$CHR_POS)) - 1000000, 0) 
+  SNPs$end<-as.numeric(as.character(SNPs$CHR_POS)) + 1000000
+  SNPs$coord<-paste0(SNPs$CHR_ID,":", SNPs$start, ":", SNPs$end)
+  coords.list<-as.list(SNPs$coord)
+  #########
+  get_genes<-function(x){
+  tmp<-getBM(attributes = c("ensembl_gene_id","hgnc_symbol", "chromosome_name","start_position","end_position","gene_biotype"),
+             filters = c("chromosomal_region"), 
+             values = list(chromosomal_region=coords.list[x]), 
+             mart = ensembl)
+  tmp$SNP <- SNPs$SNPS[x]
+  return(tmp)}
+  #########
+  gene_list<-pblapply(c(1:length(coords.list)), get_genes)
+  gene_list<-do.call("rbind", gene_list)
+  gene_list<-gene_list[!duplicated(gene_list[c(1,7)]),]
+  tads.bed <- with(hTADs, GRanges(paste0("chr",chr), IRanges(start+1, end)))
+  snploc<-data.frame("chr" = as.numeric(as.character(SNPs$CHR_ID)) , "start" = as.numeric(as.character(SNPs$CHR_POS)), "end" = as.numeric(as.character(SNPs$CHR_POS)), "snp"= SNPs$SNPS)
+  snps.bed <- with(snploc, GRanges(paste0("chr",chr), IRanges(start,end, names = snp)), snp = snp)
+  overlaps <- findOverlaps(snps.bed, tads.bed, ignore.strand = T, type = "any")
+  match_hit <- data.frame(snps.bed[queryHits(overlaps),],tads.bed[subjectHits(overlaps),], names(snps.bed)[queryHits(overlaps)],stringsAsFactors=F)
+  snp.tads <- match_hit %>% dplyr::select(seqnames.1, start.1, end.1, width.1, names.snps.bed..queryHits.overlaps..) %>% rename(seqnames.1 = "chr", start.1 = "start", end.1 = "end", width.1 = "tad.length", names.snps.bed..queryHits.overlaps.. = "snp")
+  dis.tads <- snp.tads[,c(1,2,3,5)]
+  names(dis.tads) <- c("chr","start","end","snp")
+  dis.tads$chr <- str_replace(dis.tads$chr,"chr", "")
+  dis.tads$coordinates <- paste0(dis.tads$chr, ":",dis.tads$start,":", dis.tads$end)
+  tad.coords.list <- as.list(dis.tads$coordinates)
+  #########
+  tad_genes<-function(x){
+  tmp<-getBM(attributes = c("ensembl_gene_id","hgnc_symbol", "chromosome_name", "start_position","end_position","gene_biotype"),
+             filters = c("chromosomal_region"),values = list(chromosomal_region=tad.coords.list[x]), mart = ensembl) 
+  tmp$SNP <- dis.tads$snp[x] 
+  return(tryCatch(tmp, error=function(e) NULL))}
+  #########
+  tad_gene_list<-pblapply(c(1:length(tad.coords.list)), tad_genes)
+  tad_gene_list<-do.call("rbind", tad_gene_list)
+  tad_gene_list<-tad_gene_list[!duplicated(tad_gene_list[c(1,7)]),]
+  merge_result <- unique(rbind(gene_list, tad_gene_list))
+  colnames(merge_result) <- c("gene_id","hgnc_symbol","chromosome_name","start_position","end_position","gene_biotype","SNP") 
+  ######
+  final.data<-merge(merge_result, diff_genes, by="gene_id")
+  return(DT::datatable(final.data))}
+
+  else 
+    return(print("Use of both differential gene lists and user generated SNP lists is still in development"))
+}
+
+```
